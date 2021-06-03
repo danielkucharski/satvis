@@ -301,22 +301,11 @@ const double AU_to_m = 149597870700.;//1 AU [m]
 
 int main(int argc, const char *argv[])
 {
-	printf("\nSatellite Visibility Prediction\n");
+	//printf("\nSatellite Visibility Prediction\n");
 
-	std::vector <str_tle> tle;
-	tle.resize(0);
 
-	char TLE_filepath[MAX_PATH];
-	sprintf_s(TLE_filepath, "%s", "");
-	sprintf_s(TLE_filepath, "%s", "C:\\Predictions\\3le.txt");//this is TLE file path 
-
-	read_TLE_catalogue(TLE_filepath, &tle);
-
-	//time span to test
-	double MJD_start_UTC = MJD_full(2021, 2, 10, 0, 0, 0);
-	double MJD_stop_UTC = MJD_full(2021, 2, 11, 0, 0, 0);
-	double search_step_s = 0.1;	
-	int search_steps = int((MJD_stop_UTC - MJD_start_UTC)*86400. / search_step_s)+1;
+	//demonstrate satellite visual magnitude simulation
+	//based on "Detection Probability of Earth Orbiting Objects Using Optical Sensors", Carolin Frueh, Moriba K. Jah.
 
 	//Observer location, Terrestrial system, ITRF
 	//McDonald Observatory
@@ -328,115 +317,104 @@ int main(int argc, const char *argv[])
 	Station_TCS_m.z = 3236480.7;
 	Station_TCS_rad.az = 255.9848*deg2rad;
 	Station_TCS_rad.el = 30.6802*deg2rad;
-
-	FILE *FFout;//output file pointer
-	errno_t err;
-	char OutFilename[MAX_PATH];
-	char txt_line[MAX_PATH];
-
-	sprintf_s(OutFilename, "%s", "");//output file path
-	sprintf_s(OutFilename, "%s_out.txt", TLE_filepath);
-	err = fopen_s(&FFout, OutFilename, "w");
-
-	//add header
-	sprintf_s(txt_line, "%s", "");
-	sprintf_s(txt_line, "NORAD\tPass_start_MJD_UTC\tPass_stop_MJD_UTC\tPass_duration_s");
-	fprintf(FFout, "%s\n", txt_line);
-	fclose(FFout);
-
-	bool sunlit_only = false;
-
-	for (int iSat = 0; iSat < tle.size(); iSat++)//Satellite loop
-	{
-		elsetrec tle_satrec;
-		int ReturnError = sgp4_satrec_init(&tle[iSat], &tle_satrec);
-		//0 - no error
-		//1 - mean elements, ecc >= 1.0 or ecc < -0.001 or a < 0.95 er
-		//2 - mean motion less than 0.0
-		//3 - pert elements, ecc < 0.0  or  ecc > 1.0
-		//4 - semi-latus rectum < 0.0
-		//5 - epoch elements are sub-orbital
-		//6 - satellite has decayed
+	
+	//assume 1-m diameter Lambertian sphere
+	double satellite_sphere_radius_m = 0.5;
+	double CrossSection_area_m2 = pi * satellite_sphere_radius_m * satellite_sphere_radius_m;
 		
-		double pass_start_MJD = -1.;
-		double pass_stop_MJD = -1.;
+	double Cd = 0.3;//diffuse reflection coefficient
+	double Irradiation_sun = 1368.0;// [W m-2], solar constant; solar irradiation at 1AU
+	double Sun_apparent_mag = -26.74;//V, apparent magnitude of Sun
 
-		for (int iStep=0;iStep< search_steps; iStep++)
+	//Use Topex ephemeris as an example
+	//https://www.n2yo.com/satellite/?s=22076
+	str_tle tle;
+	char TLE_line1[130] = "1 22076U 92052A   21153.54723598 -.00000049  00000-0  50937-4 0  9992";
+	char TLE_line2[130] = "2 22076  66.0414 356.1856 0007814 272.6291 123.4377 12.81032062347739";
+	read_TLE(TLE_line1, TLE_line2, &tle);
+
+	//initialize SGP4
+	elsetrec tle_satrec;
+	int ReturnError = sgp4_satrec_init(&tle, &tle_satrec);
+	//0 - no error
+	//1 - mean elements, ecc >= 1.0 or ecc < -0.001 or a < 0.95 er
+	//2 - mean motion less than 0.0
+	//3 - pert elements, ecc < 0.0  or  ecc > 1.0
+	//4 - semi-latus rectum < 0.0
+	//5 - epoch elements are sub-orbital
+	//6 - satellite has decayed
+
+
+	double simulation_duration_s = 86400.;//1 day
+	double simulation_duration_step_s = 1.;
+
+	for (double simulation_step_s=0.; simulation_step_s< simulation_duration_s; simulation_step_s+= simulation_duration_step_s)
+	{
+		double MJD = tle.MJD + simulation_step_s / 86400.;//MJD now
+
+		//get satellite position
+		double sat_ICS_km[3], sat_ICS_kmps[3];//Inertial system, ECI J2000
+		int err = sgp4(tle_satrec, MJD, sat_ICS_km, sat_ICS_kmps);
+		v3 sat_ICS_m;//Inertial system, ECI J2000
+		sat_ICS_m.x = sat_ICS_km[0] * 1000.;
+		sat_ICS_m.y = sat_ICS_km[1] * 1000.;
+		sat_ICS_m.z = sat_ICS_km[2] * 1000.;
+	
+		//convert satellite position from inertial to terrestrial cooridnate system
+		double gast_rad = GAST_rad(MJD);//GAST
+		v33 ICS_to_TCS = rz(gast_rad);//Inertial to Terrestrial
+		v33 TCS_to_ICS = inv(ICS_to_TCS);
+		v3 sat_TCS_m = ICS_to_TCS * sat_ICS_m;
+		//convert satellite position from terrestrial to topocentric cooridnate system
+		ae sat_topo_rad = topo_AzEl_rad(Station_TCS_m, Station_TCS_rad, sat_TCS_m);//topocentric coordinates			
+
+		if (sat_topo_rad.el > 0.)//satellite above horizon
 		{
-			double MJD = MJD_start_UTC + double(iStep)*search_step_s / 86400.;
-			bool step_accepted = false;
+			//check for illumination			
+			ae sun_ICS_rad = Sun_ICS_rad(MJD);//Sun coordinates
+			double Sun_Earth_m = Distance_to_the_SUN_AU(MJD) * AU_to_m;
+			v3 sun_ICS_m = get_v3(sun_ICS_rad, Sun_Earth_m);
 
-			double sat_ICS_km[3], sat_ICS_kmps[3];//Inertial system, ECI J2000
-			int err = sgp4(tle_satrec, MJD, sat_ICS_km, sat_ICS_kmps);
-			v3 sat_ICS_m;//Inertial system, ECI J2000
-			sat_ICS_m.x = sat_ICS_km[0] * 1000.;
-			sat_ICS_m.y = sat_ICS_km[1] * 1000.;
-			sat_ICS_m.z = sat_ICS_km[2] * 1000.;
+			double ShadowFunction = shadow_function(MJD, sat_ICS_m, sun_ICS_m);
 
-			double gast_rad = GAST_rad(MJD);//GAST
-			v33 ICS_to_TCS = rz(gast_rad);//Inertial to Terrestrial
-			v3 sat_TCS_m = ICS_to_TCS * sat_ICS_m;
-			ae sat_topo_rad = topo_AzEl_rad(Station_TCS_m, Station_TCS_rad, sat_TCS_m);//topocentric coordinates			
-
-			if (sat_topo_rad.el > 0.)//satellite above horizon
+			if (ShadowFunction < 0.2)//satellite in shadow
 			{
-				step_accepted = true;
-
-				if (sunlit_only)
-				{
-					//check for illumination			
-					ae sun_ICS_rad = Sun_ICS_rad(MJD);
-					double Sun_Earth_m = Distance_to_the_SUN_AU(MJD) * AU_to_m;
-					v3 sun_ICS_m = get_v3(sun_ICS_rad, Sun_Earth_m);
-
-					double ShadowFunction = shadow_function(MJD, sat_ICS_m, sun_ICS_m);
-
-					if (ShadowFunction < 0.2)//satellite in shadow
-						step_accepted = false;
-				}
+				//do not use shadowed cases
 			}
-
-			if (step_accepted)
+			else
 			{
-				if (pass_start_MJD < 0.)
-					pass_start_MJD = MJD;
+				//satellite is illuminated by the Sun and above local horizon
+				//calculate visual magnitude of the satellite assuming it is a sphere
 
-				pass_stop_MJD = MJD;
+				//calculate observer inertial position
+				v3 Station_ICS_m = TCS_to_ICS * Station_TCS_m;
+				v3 SatStation_ICS_m = Station_ICS_m - sat_ICS_m;
+				double station_satellite_range_m = norm(SatStation_ICS_m);//slant range
+				double station_satellite_R2_m2 = station_satellite_range_m * station_satellite_range_m;
+
+				//calculate satellite centered direction vectors
+				v3 SatSun_ICS_uv = normalize(sun_ICS_m - sat_ICS_m);//satellite-sun unit vector					
+				v3 SatObserver_ICS_uv = normalize(SatStation_ICS_m);
+
+				//angle between the direction vectors 
+				double phase_angle_rad = acos(dot(SatSun_ICS_uv, SatObserver_ICS_uv));
+					
+				double sphere_phase_funtion = sin(phase_angle_rad) + (pi - phase_angle_rad) * cos(phase_angle_rad);//Frueh
+				double Psi_sphere = (Cd / pi) * sphere_phase_funtion;//phase reflection function for a spherical object
+				double Irradiation_sat = Irradiation_sun * CrossSection_area_m2 * Psi_sphere / station_satellite_R2_m2;//Irradiation at the ground observing point
+				double sat_apparent_mag = Sun_apparent_mag - 2.5 * log10(Irradiation_sat / Irradiation_sun);//absolute magnitude of RSO
+				//Apparent magnitudes, based on measurements, differ from the absolute magnitudes. For absolute magnitudes, reference values are needed.
+
 			}
-
-			if ((!step_accepted)||(iStep == (search_steps-1)))
-			{
-				if ((pass_start_MJD > 0.)&&(pass_stop_MJD > pass_start_MJD))
-				{
-					double pass_duration_s = (pass_stop_MJD - pass_start_MJD)*86400.;
-					//pass finished, save info
-					err = fopen_s(&FFout, OutFilename, "a");
-					sprintf_s(txt_line, "%s", "");
-					sprintf_s(txt_line, "%d\t%.6lf\t%.6lf\t%.1lf",
-						tle[iSat].NORAD,
-						pass_start_MJD,
-						pass_stop_MJD,
-						pass_duration_s);
-					fprintf(FFout, "%s\n", txt_line);
-					fclose(FFout);
-				}
-
-				pass_start_MJD = -1.;
-				pass_stop_MJD = -1.;				
-			}
-		}//iStep
+		}
 	}
 
-	
-	tle.resize(0);
+
 	return 0;
 
 }
 
-void read_TLE_catalogue(
-	char *TLE_filepath,
-	std::vector <str_tle> *tle
-)
+void read_TLE_catalogue(char *TLE_filepath, std::vector <str_tle> *tle)
 {
 	(*tle).resize(0);
 
